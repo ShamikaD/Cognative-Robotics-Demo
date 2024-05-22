@@ -1,0 +1,175 @@
+import time
+import numpy as np
+import math
+import torch
+import torchvision
+import torchvision.transforms as transforms
+import torch.nn as nn
+import mediapipe as mp #for making images into hand parameters
+import cv2
+
+
+from cozmo_fsm import *
+    
+class gesture(StateMachineProgram):
+    def __init__(self):
+        super().__init__()
+        self.robot.camera.color_image_enabled = True
+
+    def user_image(self,image,gray):
+        self.robot.myimage = image #gets the colour image of your hand from cozmo's camera
+
+    class ShowImage(StateNode):
+        def start(self,event):
+            super().start(event)
+            print("looking for hand...")
+            boolFlag = True #to ensure that none of the functions run if a hand is not detected
+
+            #model definition
+            class Network(nn.Module):
+              def __init__(self, out_dim, in_dim, hidden_size):
+                super(Network, self).__init__()
+                self.network1 = nn.Sequential(
+                  nn.Linear(in_dim, hidden_size),
+                  nn.ReLU(),
+                  nn.Linear(hidden_size, hidden_size),
+                  nn.Linear(hidden_size, hidden_size),
+                  nn.ReLU(),
+                )
+                self.network2 = nn.Sequential(nn.Linear(hidden_size, out_dim),)
+
+              def forward(self, x):
+                out = self.network1(x)
+                out = out.view(out.size(0), -1)
+                out = self.network2(out)
+                return out
+
+            #model creation (dimentions match those in the training python file so that the pretrainedweights match)
+            device = torch.device(0)
+            in_dim = 42
+            out_dim = 10
+            hidden_size = 28
+
+            model = Network(out_dim, in_dim, hidden_size).to(device)
+
+            #load the weights
+            model.load_state_dict(torch.load("weights.pt"))
+            model.eval() 
+            
+
+            #image processing
+            image = self.robot.myimage
+            mp_hands = mp.solutions.hands
+            with mp_hands.Hands(
+                static_image_mode=True,
+                max_num_hands=1,
+                min_detection_confidence=0.3) as hands:
+                cv2.imwrite("img.png", (cv2.flip(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), 1)))
+                results = hands.process(cv2.flip(cv2.cvtColor(cv2.imread("img.png"), cv2.COLOR_BGR2RGB), 1))
+                # Draw hand landmarks.
+           
+                if results.multi_hand_landmarks is not None:
+                    boolFlag = False
+                    hand_landmarks = results.multi_hand_landmarks[0] #there should only be one element in the array but we want to get rid of the outside array
+                    image_height, image_width, image_depth = image.shape
+                    
+                    temp = []
+                    for i in range(21): #21 is the number of points on the hand that mediapipe detects
+                        temp.append(hand_landmarks.landmark[i].x)
+                        temp.append(hand_landmarks.landmark[i].y)
+                        #not using z coordinates because cozmo's grainy camera makes it hard for mediapipe to "see" depth because of the messed up colouring of shadows and such
+                    
+                    ''' 
+                    #uncomment to see the graphical representation of the hand image that Cozmo sees!
+                    annotated_image = image.copy()
+                    mp_drawing = mp.solutions.drawing_utils
+                    mp_drawing_styles = mp.solutions.drawing_styles
+                    mp_drawing.draw_landmarks(
+                      annotated_image,
+                      hand_landmarks,
+                      mp_hands.HAND_CONNECTIONS,
+                      mp_drawing_styles.get_default_hand_landmarks_style(),
+                      mp_drawing_styles.get_default_hand_connections_style())
+                    cv2.imwrite(
+                        '/tmp/annotated_image' + '.png', cv2.flip(annotated_image, 1))
+                        
+                    for hand_world_landmarks in results.multi_hand_world_landmarks:
+                      mp_drawing.plot_landmarks(
+                        hand_world_landmarks, mp_hands.HAND_CONNECTIONS, azimuth=5)
+                    '''
+
+            if not boolFlag:
+                vect = np.array(temp)
+                
+                #predicting number based on image
+                temp = torch.tensor(np.resize(vect,(1,1,in_dim)))
+                temp = temp.to(device)
+                output = model(temp.float())
+                output = output.detach()
+                predict = torch.argmax(output)
+                print(predict)
+                print(predict.item())
+                self.post_data(predict)
+            else:
+                self.post_failure()
+            
+            
+    class Action(Turn):
+        def start(self, event=None):
+            if isinstance(event, DataEvent):
+                if event.data == 0: #forward
+                    self.angle = degrees(0)
+                    super().start(event)
+                elif event.data == 3: #right
+                    self.angle = degrees(90)
+                    super().start(event)
+                elif event.data == 2: #left
+                    self.angle = degrees(-90)
+                    super().start(event) 
+                elif event.data == 1: #back
+                    super().start(event)
+                    self.post_success()
+                elif event.data == 4: #spin
+                    super().start(event)
+                    self.post_failure()
+                else:
+                    super().start(event)
+                    self.post_data(event.data)
+                    
+    class Speak(Say):
+        def start(self, event=None):
+            if isinstance(event, DataEvent):
+                if event.data == 5: #sad
+                    robot.play_anim_trigger(CodeLabDejected)
+                    self.text = 'Let me find a cube'
+                    super().start(event)
+                elif event.data == 6: #happy
+                    robot.play_anim_trigger(cozmo.anim.Triggers.CodeLabHappy)
+                    self.text = 'Thanks for the thumbs up'
+                    super().start(event)
+                elif event.data == 7: #hello
+                    self.text = 'hello? Who\'s on the phone'
+                    super().start(event)
+                elif event.data == 8: #peace
+                    self.text = 'peace'
+                    super().start(event)
+                else: #mads
+                    robot.play_anim_trigger(cozmo.anim.Triggers.CodeLabCelebrate)
+                    self.text = 'WooHoo'
+                    super().start(event)
+                    
+
+    $setup{
+        loop: StateNode()
+        loop =T(1)=> SetHeadAngle(20) =C=> SetLiftHeight(0) =C=> img =D=> act
+        img =F=> loop
+        img: self.ShowImage()
+        
+        act: self.Action()
+        act =C=> Forward(100) =C=> loop
+        act =S=> Forward(-100) =C=> loop
+        act =F=> Turn(360) =C=> loop
+        
+        act =D=> self.Speak() =C=> loop
+
+    }
